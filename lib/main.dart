@@ -23,6 +23,9 @@ import 'network/network_connection_screen.dart';
 import 'network/network_service.dart';
 import 'dart:async';
 
+final RouteObserver<ModalRoute<void>> appRouteObserver =
+    RouteObserver<ModalRoute<void>>();
+
 // ==================== ابزارهای تاریخ و خوش‌آمدگویی ====================
 
 List<int> _gregorianToJalali(int gy, int gm, int gd) {
@@ -714,6 +717,7 @@ class _DeliveryAppState extends State<DeliveryApp> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorObservers: [appRouteObserver],
       title: 'Karim Ahle Beit',
       theme: ThemeData(
         useMaterial3: true,
@@ -1346,7 +1350,7 @@ class DeliveryScreen extends StatefulWidget {
 }
 
 class _DeliveryScreenState extends State<DeliveryScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, RouteAware {
   String _normalizeDigits(String value) {
     const fa = '۰۱۲۳۴۵۶۷۸۹';
     const ar = '٠١٢٣٤٥٦٧٨٩';
@@ -1433,14 +1437,45 @@ class _DeliveryScreenState extends State<DeliveryScreen>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute) {
+      appRouteObserver.subscribe(this, route);
+    }
+  }
+
+  @override
+  void didPopNext() {
+    _closeKeyboard();
+    if (mounted) {
+      _refreshFixedEventDatesFromPrefs();
+    }
+  }
+
+  @override
+  void didPush() {}
+
+  @override
+  void didPushNext() {
+    _closeKeyboard();
+  }
+
+  @override
+  void didPop() {}
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      _closeKeyboard();
+      _refreshFixedEventDatesFromPrefs();
       _checkForDatabaseUpdate();
     }
   }
 
   @override
   void dispose() {
+    appRouteObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     _snapshotCheckTimer?.cancel();
     _nameController.dispose();
@@ -1479,20 +1514,31 @@ class _DeliveryScreenState extends State<DeliveryScreen>
     try {
       final network = NetworkService();
       final info = await network.fetchSnapshotInfo();
+      await _syncNetworkMessages();
       if (info == null || !mounted) return;
       final prefs = await SharedPreferences.getInstance();
       final seen = prefs.getString('database_update_seen_at') ?? '';
-      if (seen == info.updatedAt) return;
-
-      await prefs.setString(
-          'manager_message', 'بروزرسانی بانک اطلاعاتی موجود است');
-      await prefs.setString(
-          'manager_message_id', 'database_update:$info.updatedAt');
-      if (!mounted) return;
-      setState(() => _hasNewManagerMessage = true);
-      await StoreNotificationService.instance.showDatabaseUpdateAvailable(
-        storeName: _storeName,
+      final notified = prefs.getString('database_update_notified_at') ?? '';
+      final deletedIds =
+          (prefs.getStringList('deleted_app_message_ids') ?? const <String>[])
+              .toSet();
+      final messageId = 'database_update:${info.updatedAt}';
+      await _upsertAppMessage(
+        id: messageId,
+        title: 'بروزرسانی بانک اطلاعاتی',
+        body: 'بروزرسانی بانک اطلاعاتی موجود است',
       );
+      if (notified != info.updatedAt) {
+        await StoreNotificationService.instance.showDatabaseUpdateAvailable(
+          storeName: _storeName,
+        );
+        await prefs.setString('database_update_notified_at', info.updatedAt);
+      }
+      if (deletedIds.contains(messageId) || seen == info.updatedAt) {
+        if (mounted) setState(() => _hasNewManagerMessage = false);
+      } else if (mounted) {
+        setState(() => _hasNewManagerMessage = true);
+      }
     } catch (_) {
       // بررسی دوره‌ای نباید مانع اجرای برنامه شود.
     } finally {
@@ -1500,35 +1546,131 @@ class _DeliveryScreenState extends State<DeliveryScreen>
     }
   }
 
-  Future<void> _loadManagerMessage() async {
+  Future<List<AppMessage>> _loadAppMessages() async {
     final prefs = await SharedPreferences.getInstance();
-    final message = prefs.getString('manager_message') ?? '';
-    final messageId = prefs.getString('manager_message_id') ?? '';
-    final readId = prefs.getString('manager_message_read_id') ?? '';
+    final raw = prefs.getString('app_messages') ?? '[]';
+    try {
+      return (jsonDecode(raw) as List)
+          .whereType<Map>()
+          .map((e) => AppMessage.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _saveAppMessages(List<AppMessage> messages) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+        'app_messages', jsonEncode(messages.map((e) => e.toJson()).toList()));
+  }
+
+  Future<void> _upsertAppMessage({
+    required String id,
+    required String title,
+    required String body,
+    DateTime? createdAt,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final deleted =
+        (prefs.getStringList('deleted_app_message_ids') ?? const <String>[])
+            .toSet();
+    if (deleted.contains(id)) return;
+    final messages = await _loadAppMessages();
+    final index = messages.indexWhere((m) => m.id == id);
+    final item = AppMessage(
+      id: id,
+      title: title,
+      body: body,
+      createdAt: createdAt ?? DateTime.now(),
+      isRead: index >= 0 ? messages[index].isRead : false,
+    );
+    if (index >= 0) {
+      messages[index] = item;
+    } else {
+      messages.insert(0, item);
+    }
+    await _saveAppMessages(messages);
+    if (mounted) {
+      setState(() => _hasNewManagerMessage = messages.any((m) => !m.isRead));
+    }
+  }
+
+  Future<void> _syncNetworkMessages() async {
+    try {
+      final events = await NetworkService().fetchRecentEvents();
+      for (final event in events) {
+        final type = event['type']?.toString() ?? '';
+        if (type != 'invoice_created') continue;
+        final payload = Map<String, dynamic>.from(event['payload'] ?? {});
+        final number = payload['invoiceNumber']?.toString() ?? '';
+        final total = payload['total']?.toString() ?? '0';
+        final eventId = event['id']?.toString() ?? '';
+        if (eventId.isEmpty || number.isEmpty) continue;
+        await _upsertAppMessage(
+          id: 'network:$eventId',
+          title: 'ثبت فاکتور فروش',
+          body:
+              'فاکتور شماره ${_toPersianDigits(number)} با مبلغ ${_formatPrice(int.tryParse(total) ?? 0)} ریال ثبت شد.',
+          createdAt: DateTime.tryParse(event['created_at']?.toString() ?? ''),
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadManagerMessage() async {
+    // سازگاری با نسخه‌های قدیمی که فقط یک پیام ذخیره می‌کردند.
+    final prefs = await SharedPreferences.getInstance();
+    final legacy = prefs.getString('manager_message') ?? '';
+    final legacyId = prefs.getString('manager_message_id') ?? '';
+    if (legacy.trim().isNotEmpty && legacyId.isNotEmpty) {
+      await _upsertAppMessage(
+        id: legacyId,
+        title: 'پیام مدیر',
+        body: legacy,
+      );
+    }
+    await _syncNetworkMessages();
+    final messages = await _loadAppMessages();
     if (!mounted) return;
-    setState(() => _hasNewManagerMessage =
-        message.trim().isNotEmpty && messageId != readId);
+    setState(() => _hasNewManagerMessage = messages.any((m) => !m.isRead));
   }
 
   Future<void> _openManagerMessage() async {
-    final prefs = await SharedPreferences.getInstance();
-    final message = prefs.getString('manager_message') ?? '';
-    final messageId = prefs.getString('manager_message_id') ?? '';
-    if (message.trim().isEmpty) {
-      if (mounted) _showSuccessMessage('پیامی از مدیر ثبت نشده است');
+    var messages = await _loadAppMessages();
+    if (messages.isEmpty) {
+      if (mounted) _showSuccessMessage('پیامی ثبت نشده است');
       return;
     }
-    await prefs.setString('manager_message_read_id', messageId);
-    if (messageId.startsWith('database_update:')) {
-      await prefs.setString('database_update_seen_at',
-          messageId.substring('database_update:'.length));
-    }
+    messages = messages.map((m) => m.copyWith(isRead: true)).toList();
+    await _saveAppMessages(messages);
     if (mounted) setState(() => _hasNewManagerMessage = false);
     if (!mounted) return;
     await Navigator.push(
       context,
-      _slideRoute(ManagerMessagesScreen(message: message)),
+      _slideRoute(ManagerMessagesScreen(
+        messages: messages,
+        onMessagesChanged: (updated) async {
+          await _saveAppMessages(updated);
+          if (mounted)
+            setState(
+                () => _hasNewManagerMessage = updated.any((m) => !m.isRead));
+        },
+      )),
     );
+  }
+
+  Future<void> _refreshFixedEventDatesFromPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final inventoryRaw = prefs.getString('fixed_inventory_last_date_v2');
+    final cleaningRaw = prefs.getString('fixed_cleaning_last_date_v1');
+    if (!mounted) return;
+    setState(() {
+      if (inventoryRaw != null)
+        _lastInventoryDate = DateTime.tryParse(inventoryRaw);
+      if (cleaningRaw != null)
+        _lastCleaningDate = DateTime.tryParse(cleaningRaw);
+    });
   }
 
   Future<void> _loadCustomEvents() async {
@@ -4194,6 +4336,46 @@ class _DeliveryScreenState extends State<DeliveryScreen>
                                               invoiceImagePath: imagePath,
                                             );
                                           }
+                                          if (editGroup == null &&
+                                              selected.isNotEmpty) {
+                                            final network = NetworkService();
+                                            final eventId =
+                                                await network.queueEvent(
+                                              type: 'invoice_created',
+                                              actorName: _userName,
+                                              payload: {
+                                                'invoiceNumber': invoiceNumber,
+                                                'total': math.max(
+                                                    0,
+                                                    selected.fold<int>(0,
+                                                            (sum, line) {
+                                                          final p = line[
+                                                                  'product']
+                                                              as ProductDatabaseItem;
+                                                          final qty =
+                                                              line['quantity']
+                                                                  as int;
+                                                          return sum +
+                                                              p.sellPrice * qty;
+                                                        }) -
+                                                        discount),
+                                                'itemsCount': selected.length,
+                                              },
+                                            );
+                                            await network.syncOutbox();
+                                            await _upsertAppMessage(
+                                              id: 'network:$eventId',
+                                              title: 'ثبت فاکتور فروش',
+                                              body: 'فاکتور شماره ${_toPersianDigits(invoiceNumber.toString())} با مبلغ ${_formatPrice(math.max(0, selected.fold<int>(0, (sum, line) {
+                                                    final p = line['product']
+                                                        as ProductDatabaseItem;
+                                                    final qty =
+                                                        line['quantity'] as int;
+                                                    return sum +
+                                                        p.sellPrice * qty;
+                                                  }) - discount))} ریال ثبت شد.',
+                                            );
+                                          }
                                           _addSmartLog(editGroup != null
                                               ? '✏️ فاکتور شماره $invoiceNumber ویرایش شد'
                                               : '💰 فاکتور شماره $invoiceNumber با ${selected.length} قلم ثبت شد');
@@ -6463,55 +6645,115 @@ class _DeliveryScreenState extends State<DeliveryScreen>
 // ==================== ادامه کد (ManifestScreen, SalesInvoicesScreen, SettingsScreen, ProductDatabaseScreen, BarcodeScannerScreen و مدل‌ها) در پاسخ بعدی ====================
 // ==================== صفحه اختصاصی بارنامه‌ها ====================
 
-class ManagerMessagesScreen extends StatelessWidget {
-  final String message;
+class ManagerMessagesScreen extends StatefulWidget {
+  final List<AppMessage> messages;
+  final Future<void> Function(List<AppMessage>) onMessagesChanged;
 
-  const ManagerMessagesScreen({super.key, required this.message});
+  const ManagerMessagesScreen({
+    super.key,
+    required this.messages,
+    required this.onMessagesChanged,
+  });
+
+  @override
+  State<ManagerMessagesScreen> createState() => _ManagerMessagesScreenState();
+}
+
+class _ManagerMessagesScreenState extends State<ManagerMessagesScreen> {
+  late List<AppMessage> _messages;
+
+  @override
+  void initState() {
+    super.initState();
+    _messages = List<AppMessage>.from(widget.messages);
+  }
+
+  Future<void> _deleteMessage(int index) async {
+    final deletedId = _messages[index].id;
+    setState(() => _messages.removeAt(index));
+    final prefs = await SharedPreferences.getInstance();
+    final deleted =
+        prefs.getStringList('deleted_app_message_ids') ?? <String>[];
+    if (!deleted.contains(deletedId)) deleted.add(deletedId);
+    await prefs.setStringList('deleted_app_message_ids', deleted);
+    await widget.onMessagesChanged(_messages);
+  }
+
+  Future<void> _deleteAll() async {
+    if (_messages.isEmpty) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('حذف همه پیام‌ها'),
+        content: const Text('همه پیام‌های دریافتی حذف شوند؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('انصراف')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('حذف همه')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final prefs = await SharedPreferences.getInstance();
+    final deleted =
+        prefs.getStringList('deleted_app_message_ids') ?? <String>[];
+    for (final message in _messages) {
+      if (!deleted.contains(message.id)) deleted.add(message.id);
+    }
+    await prefs.setStringList('deleted_app_message_ids', deleted);
+    setState(() => _messages.clear());
+    await widget.onMessagesChanged(_messages);
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('پیام‌ها'),
-        backgroundColor: Colors.green.shade700,
-        foregroundColor: Colors.white,
+        actions: [
+          if (_messages.isNotEmpty)
+            IconButton(
+                onPressed: _deleteAll,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                tooltip: 'حذف همه'),
+        ],
       ),
       body: Directionality(
         textDirection: TextDirection.rtl,
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Card(
-              elevation: 2,
-              child: Padding(
-                padding: const EdgeInsets.all(18),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Row(
-                      children: [
-                        CircleAvatar(
-                          backgroundColor: Colors.orange.shade100,
-                          child: Icon(Icons.campaign_outlined,
-                              color: Colors.orange.shade800),
-                        ),
-                        const SizedBox(width: 12),
-                        const Expanded(
-                          child: Text('پیام مدیر',
-                              style: TextStyle(
-                                  fontSize: 18, fontWeight: FontWeight.bold)),
-                        ),
-                      ],
+        child: _messages.isEmpty
+            ? const Center(child: Text('پیامی وجود ندارد'))
+            : ListView.separated(
+                padding: const EdgeInsets.all(16),
+                itemCount: _messages.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 10),
+                itemBuilder: (context, index) {
+                  final message = _messages[index];
+                  return Card(
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: Colors.amber.shade100,
+                        child: Icon(Icons.notifications_active_outlined,
+                            color: Colors.amber.shade800),
+                      ),
+                      title: Text(message.title,
+                          style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Padding(
+                        padding: const EdgeInsets.only(top: 7),
+                        child: Text(message.body,
+                            style: const TextStyle(height: 1.7)),
+                      ),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        tooltip: 'حذف پیام',
+                        onPressed: () => _deleteMessage(index),
+                      ),
                     ),
-                    const Divider(height: 28),
-                    Text(message,
-                        style: const TextStyle(fontSize: 16, height: 1.8)),
-                  ],
-                ),
+                  );
+                },
               ),
-            ),
-          ],
-        ),
       ),
     );
   }
@@ -9230,10 +9472,54 @@ class _SalesProfitScreenState extends State<SalesProfitScreen> {
     for (final p in _products) {
       if (p.groupName.trim().isNotEmpty) values.add(p.groupName.trim());
     }
-    final groups = ['همه'];
-    if (_products.any((p) => p.isNewProduct)) groups.add('🆕 کالاهای جدید');
+
+    // «کالاهای جدید» یک گروه ویژه است و همیشه باید در صدر گروه‌ها باشد.
+    // بعد از آن «همه گروه‌ها» و سپس گروه‌های عادی نمایش داده می‌شوند.
+    final groups = <String>[];
+    if (_products.any((p) => p.isNewProduct)) {
+      groups.add('🆕 کالاهای جدید');
+    }
+    groups.add('همه');
     groups.addAll(values.where((e) => e != 'همه'));
     return groups;
+  }
+
+  Widget _groupChip(String group) {
+    final selected = _selectedGroup == group;
+    final isNewGroup = group == '🆕 کالاهای جدید';
+    final label = group == 'همه' ? 'همه گروه‌ها' : group;
+
+    // رنگ متن در حالت انتخاب‌شده عمداً تیره و خوانا است تا با زمینه روشن/سبز
+    // تداخل نداشته باشد و «کالاهای جدید» نیز با رنگ طلایی هویت مستقل داشته باشد.
+    final foreground = selected
+        ? (isNewGroup ? Colors.brown.shade900 : Colors.green.shade900)
+        : (isNewGroup ? Colors.amber.shade900 : Colors.grey.shade900);
+    final background = isNewGroup
+        ? (selected ? Colors.amber.shade200 : Colors.amber.shade50)
+        : (selected ? Colors.green.shade100 : Colors.grey.shade100);
+
+    return ChoiceChip(
+      selected: selected,
+      backgroundColor: background,
+      selectedColor: background,
+      side: BorderSide(
+        color: isNewGroup ? Colors.amber.shade700 : Colors.grey.shade400,
+      ),
+      avatar: Icon(
+        isNewGroup ? Icons.star_rounded : Icons.folder_rounded,
+        size: 19,
+        color: foreground,
+      ),
+      label: Text(
+        label,
+        style: TextStyle(
+          color: foreground,
+          fontWeight:
+              selected || isNewGroup ? FontWeight.w800 : FontWeight.w600,
+        ),
+      ),
+      onSelected: (_) => setState(() => _selectedGroup = group),
+    );
   }
 
   List<ProductDatabaseItem> get _filteredProducts {
@@ -9399,11 +9685,7 @@ class _SalesProfitScreenState extends State<SalesProfitScreen> {
                 separatorBuilder: (_, __) => const SizedBox(width: 6),
                 itemBuilder: (_, index) {
                   final group = _groups[index];
-                  return ChoiceChip(
-                    label: Text(group == 'همه' ? 'همه گروه‌ها' : '📁 $group'),
-                    selected: _selectedGroup == group,
-                    onSelected: (_) => setState(() => _selectedGroup = group),
-                  );
+                  return _groupChip(group);
                 },
               ),
             ),
@@ -9932,6 +10214,15 @@ class _ProductDatabaseScreenState extends State<ProductDatabaseScreen> {
       final bytes = File(result.files.single.path!).readAsBytesSync();
       final excel = excel_lib.Excel.decodeBytes(bytes);
       int addedCount = 0;
+      int updatedCount = 0;
+
+      // بانک فعلی را بر اساس بارکد ایندکس می‌کنیم تا وارد کردن بانک جدید
+      // باعث ایجاد کالای تکراری نشود.
+      final existingByBarcode = <String, int>{};
+      for (var i = 0; i < _items.length; i++) {
+        final barcode = _items[i].barcode.trim();
+        if (barcode.isNotEmpty) existingByBarcode[barcode] = i;
+      }
 
       for (var table in excel.tables.keys) {
         final rows = excel.tables[table]?.rows;
@@ -9955,17 +10246,39 @@ class _ProductDatabaseScreenState extends State<ProductDatabaseScreen> {
                   row[4]?.value?.toString().replaceAll(',', '') ?? '0') ??
               0;
 
-          if (col1.isNotEmpty) {
-            _items.add(ProductDatabaseItem(
-              barcode: col0,
+          if (col1.isEmpty) continue;
+
+          final barcode = col0;
+          final group = groupName.isEmpty ? 'عمومی' : groupName;
+
+          if (barcode.isNotEmpty && existingByBarcode.containsKey(barcode)) {
+            // بارکد قبلاً در بانک وجود داشته است: نام، گروه و تنظیمات
+            // مدیریتی قبلی حفظ می‌شوند و فقط موجودی و قیمت‌ها به‌روز می‌شوند.
+            final index = existingByBarcode[barcode]!;
+            final old = _items[index];
+            _items[index] = old.copyWith(
+              stock: stock,
+              buyPrice: buyPrice,
+              sellPrice: sellPrice,
+            );
+            updatedCount++;
+          } else {
+            // بارکد جدید است و وارد چرخه سه‌نوبتی «کالاهای جدید» می‌شود.
+            final item = ProductDatabaseItem(
+              barcode: barcode,
               name: col1,
               stock: stock,
               buyPrice: buyPrice,
               sellPrice: sellPrice,
               folder: 'عمومی',
-              groupName: groupName.isEmpty ? 'عمومی' : groupName,
+              groupName: group,
               isNewProduct: true,
-            ));
+              newProductBankAppearances: 0,
+            );
+            _items.add(item);
+            if (barcode.isNotEmpty) {
+              existingByBarcode[barcode] = _items.length - 1;
+            }
             addedCount++;
           }
         }
@@ -9975,7 +10288,10 @@ class _ProductDatabaseScreenState extends State<ProductDatabaseScreen> {
       _notifyUpdate();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-            content: Text('$addedCount کالا با موفقیت از اکسل اضافه شد ✅')),
+          content: Text(
+            '$addedCount کالای جدید اضافه شد و $updatedCount کالای قبلی بر اساس بارکد به‌روزرسانی شد ✅',
+          ),
+        ),
       );
     } catch (e) {
       setState(() => _isLoading = false);
@@ -11204,6 +11520,45 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen> {
 
 // ==================== مدل‌های داده ====================
 
+class AppMessage {
+  final String id;
+  final String title;
+  final String body;
+  final DateTime createdAt;
+  final bool isRead;
+
+  const AppMessage(
+      {required this.id,
+      required this.title,
+      required this.body,
+      required this.createdAt,
+      this.isRead = false});
+
+  AppMessage copyWith({bool? isRead}) => AppMessage(
+      id: id,
+      title: title,
+      body: body,
+      createdAt: createdAt,
+      isRead: isRead ?? this.isRead);
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'body': body,
+        'createdAt': createdAt.toIso8601String(),
+        'isRead': isRead
+      };
+
+  factory AppMessage.fromJson(Map<String, dynamic> json) => AppMessage(
+        id: json['id']?.toString() ?? '',
+        title: json['title']?.toString() ?? 'پیام',
+        body: json['body']?.toString() ?? '',
+        createdAt: DateTime.tryParse(json['createdAt']?.toString() ?? '') ??
+            DateTime.now(),
+        isRead: json['isRead'] == true,
+      );
+}
+
 class CustomEvent {
   final String id;
   final String name;
@@ -11337,6 +11692,9 @@ class ProductDatabaseItem {
   final bool isPriceModified;
   final int? originalSellPrice;
   final bool isNewProduct;
+  // تعداد دفعاتی که این بارکد از زمان ورود به بانک جدید دیده شده است.
+  // 1، 2 و 3 یعنی کالا در گروه «کالاهای جدید» باقی می‌ماند؛ از نوبت چهارم خارج می‌شود.
+  final int newProductBankAppearances;
 
   ProductDatabaseItem({
     required this.barcode,
@@ -11349,6 +11707,7 @@ class ProductDatabaseItem {
     this.isPriceModified = false,
     this.originalSellPrice,
     this.isNewProduct = false,
+    this.newProductBankAppearances = 0,
   });
 
   ProductDatabaseItem copyWith({
@@ -11362,6 +11721,7 @@ class ProductDatabaseItem {
     bool? isPriceModified,
     int? originalSellPrice,
     bool? isNewProduct,
+    int? newProductBankAppearances,
   }) =>
       ProductDatabaseItem(
         barcode: barcode ?? this.barcode,
@@ -11374,6 +11734,8 @@ class ProductDatabaseItem {
         isPriceModified: isPriceModified ?? this.isPriceModified,
         originalSellPrice: originalSellPrice ?? this.originalSellPrice,
         isNewProduct: isNewProduct ?? this.isNewProduct,
+        newProductBankAppearances:
+            newProductBankAppearances ?? this.newProductBankAppearances,
       );
 
   Map<String, dynamic> toJson() => {
@@ -11387,6 +11749,7 @@ class ProductDatabaseItem {
         'isPriceModified': isPriceModified,
         'originalSellPrice': originalSellPrice,
         'isNewProduct': isNewProduct,
+        'newProductBankAppearances': newProductBankAppearances,
       };
 
   factory ProductDatabaseItem.fromJson(Map<String, dynamic> json) =>
@@ -11400,6 +11763,12 @@ class ProductDatabaseItem {
         groupName: (json['groupName'] ?? json['folder'] ?? 'عمومی').toString(),
         isPriceModified: json['isPriceModified'] == true,
         isNewProduct: json['isNewProduct'] == true,
+        newProductBankAppearances: json['newProductBankAppearances'] is num
+            ? (json['newProductBankAppearances'] as num)
+                .toInt()
+                .clamp(0, 4)
+                .toInt()
+            : 0,
         originalSellPrice: json['originalSellPrice'] is num
             ? (json['originalSellPrice'] as num).toInt()
             : null,
