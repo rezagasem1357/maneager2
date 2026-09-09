@@ -91,6 +91,63 @@ String _toPersianDigits(String value) {
   return result;
 }
 
+
+class ThousandsSeparatorInputFormatter extends TextInputFormatter {
+  static String _normalize(String value) {
+    const fa = '۰۱۲۳۴۵۶۷۸۹';
+    const ar = '٠١٢٣٤٥٦٧٨٩';
+    for (var i = 0; i < 10; i++) {
+      value = value.replaceAll(fa[i], '$i').replaceAll(ar[i], '$i');
+    }
+    return value;
+  }
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    final rawCursorOffset = newValue.selection.baseOffset;
+    final cursorOffset = rawCursorOffset < 0
+        ? newValue.text.length
+        : (rawCursorOffset > newValue.text.length ? newValue.text.length : rawCursorOffset);
+    final beforeCursor = _normalize(newValue.text.substring(0, cursorOffset));
+    final digitsBeforeCursor = beforeCursor.replaceAll(RegExp(r'[^0-9]'), '').length;
+    final digits = _normalize(newValue.text)
+        .replaceAll(',', '')
+        .replaceAll('٬', '')
+        .replaceAll(RegExp(r'[^0-9]'), '');
+
+    if (digits.isEmpty) return const TextEditingValue();
+    final number = int.tryParse(digits);
+    if (number == null) return oldValue;
+
+    final formatted = _toPersianDigits(
+      number.toString().replaceAllMapped(
+        RegExp(r'\B(?=(\d{3})+(?!\d))'),
+        (m) => ',',
+      ),
+    );
+
+    var newCursor = formatted.length;
+    if (digitsBeforeCursor < digits.length) {
+      var seen = 0;
+      for (var i = 0; i < formatted.length; i++) {
+        if (RegExp(r'[۰-۹]').hasMatch(formatted[i])) seen++;
+        if (seen >= digitsBeforeCursor) {
+          newCursor = i + 1;
+          break;
+        }
+      }
+    }
+
+    return TextEditingValue(
+      text: formatted,
+      selection: TextSelection.collapsed(offset: newCursor),
+    );
+  }
+}
+
 String _todayJalali() {
   final now = DateTime.now();
   final j = _gregorianToJalali(now.year, now.month, now.day);
@@ -897,6 +954,13 @@ class _DeliveryAppState extends State<DeliveryApp> with WidgetsBindingObserver {
       ),
       themeMode: _isDarkMode ? ThemeMode.dark : ThemeMode.light,
       locale: const Locale('fa'),
+      // RTL سراسری: تمام رابط کاربری فارسی از راست به چپ نمایش داده می‌شود.
+      // ویجت‌هایی که ذاتاً LTR هستند (مثل بارکد، URL و ورودی‌های عددی خاص)
+      // همچنان می‌توانند با textDirection صریح خودشان جهت را override کنند.
+      builder: (context, child) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: const Directionality(
         textDirection: TextDirection.rtl,
         child: SplashScreen(),
@@ -1631,7 +1695,11 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
         if (eventId.isEmpty) continue;
         final actor = event['actor_name']?.toString().trim();
         final actorRole = payload['actorRole']?.toString() ?? event['actor_role']?.toString() ?? '';
-        final actorText = actorRole == 'manager' ? 'مدیر' : actorRole == 'cashier' ? 'صندوقدار' : (actor?.isNotEmpty == true ? actor! : 'کاربر');
+        final actorText = actorRole == 'manager'
+            ? 'مدیر${actor?.isNotEmpty == true ? ' «${actor!}»' : ''}'
+            : actorRole == 'cashier'
+                ? 'صندوقدار${actor?.isNotEmpty == true ? ' «${actor!}»' : ''}'
+                : (actor?.isNotEmpty == true ? actor! : 'کاربر');
         String title;
         String body;
         if (type == 'invoice_created') {
@@ -4308,6 +4376,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                           actorName: _userName,
                                           payload: {
                                             'invoiceNumber': invoiceNumber,
+                                            'actorRole': 'manager',
                                             'total': math.max(0, selected.fold<int>(0, (sum, line) {
                                               final p = line['product'] as ProductDatabaseItem;
                                               final qty = line['quantity'] as int;
@@ -4909,6 +4978,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
         actorName: _userName,
         payload: {
           'manifestNumber': manifest.number,
+          'actorRole': 'manager',
           'date': manifest.date,
           'senderCompany': manifest.senderCompany,
           'freightCost': manifest.freightCost,
@@ -8547,6 +8617,7 @@ class _DailyExpensesScreenState extends State<DailyExpensesScreen> {
           actorName: (await SharedPreferences.getInstance()).getString('user_name') ?? '',
           payload: {
             'expenseId': item.id,
+            'actorRole': 'manager',
             'name': item.name,
             'amount': item.amount,
             'date': item.date,
@@ -8556,7 +8627,7 @@ class _DailyExpensesScreenState extends State<DailyExpensesScreen> {
         await _upsertNetworkAppMessage(
           id: 'network:$eventId',
           title: 'ثبت هزینه روزانه',
-          body: 'مدیر: هزینه «${item.name}» به مبلغ ${_formatPrice(item.amount)} ریال ثبت شد.',
+          body: 'مدیر «${(await SharedPreferences.getInstance()).getString('user_name')?.trim().isNotEmpty == true ? (await SharedPreferences.getInstance()).getString('user_name')!.trim() : 'مدیر'}»: هزینه «${item.name}» به مبلغ ${_formatPrice(item.amount)} ریال ثبت شد.',
         );
       } catch (_) {}
     }
@@ -9431,21 +9502,7 @@ class _SalesProfitScreenState extends State<SalesProfitScreen> {
             controller: controller,
             autofocus: true,
             keyboardType: TextInputType.number,
-            onChanged: (value) {
-              final raw = value.replaceAll(',', '').replaceAll('٬', '').trim();
-              if (raw.isEmpty) return;
-              final number = int.tryParse(raw);
-              if (number == null) return;
-              final formatted = _toPersianDigits(number.toString().replaceAllMapped(
-                RegExp(r'\B(?=(\d{3})+(?!\d))'),
-                (m) => ',',
-              ));
-              if (controller.text == formatted) return;
-              controller.value = TextEditingValue(
-                text: formatted,
-                selection: TextSelection.collapsed(offset: formatted.length),
-              );
-            },
+            inputFormatters: [ThousandsSeparatorInputFormatter()],
             textDirection: TextDirection.rtl,
             decoration: const InputDecoration(
               labelText: 'قیمت فروش جدید (ریال)',
