@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'network_service.dart';
@@ -154,6 +155,24 @@ class _NetworkConnectionScreenState extends State<NetworkConnectionScreen> {
       _lastSync = last;
       _status = 'بانک اطلاعاتی از سرور دریافت و روی دستگاه ذخیره شد.';
     });
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('توجه'),
+        content: const Text('نرم‌افزار برای بروزرسانی اطلاعات باید ریستارت شود.'),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              SystemNavigator.pop();
+            },
+            child: const Text('باشه'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _uploadProductDatabase() async {
