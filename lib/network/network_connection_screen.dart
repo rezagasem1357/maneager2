@@ -165,14 +165,16 @@ class _NetworkConnectionScreenState extends State<NetworkConnectionScreen> {
     await _saveSettings();
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('product_database') ?? '[]';
+
+    // فقط «ارسال بانک» یک نوبت جدید برای تشخیص کالاهای تازه محسوب می‌شود.
+    // بنابراین تغییر روزشمار، هزینه‌ها یا رویدادهای دیگر باعث جلو رفتن شمارنده
+    // کالای جدید نمی‌شود.
     final oldSnapshot = await _service.downloadSnapshot();
     List<dynamic> products = [];
     try {
       products = jsonDecode(raw) as List<dynamic>;
     } catch (_) {}
 
-    // «جدید» بودن بر اساس بانک قبلی سرور تعیین می‌شود؛ کالاهای جدیدی که قبلاً
-    // در برنامه علامت خورده‌اند نیز علامت خود را حفظ می‌کنند.
     final oldProducts = oldSnapshot?['product_database'];
     final oldBarcodes = oldProducts is List
         ? oldProducts
@@ -181,17 +183,58 @@ class _NetworkConnectionScreenState extends State<NetworkConnectionScreen> {
             .where((e) => e.isNotEmpty)
             .toSet()
         : <String>{};
-    if (oldProducts is List) {
-      products = products.map((rawItem) {
-        final item = Map<String, dynamic>.from(rawItem as Map);
-        final barcode = item['barcode']?.toString().trim() ?? '';
-        if (!oldBarcodes.contains(barcode)) {
-          item['isNewProduct'] = true;
-        }
-        return item;
-      }).toList();
-      await prefs.setString('product_database', jsonEncode(products));
+
+    // سابقهٔ ورود هر بارکد به بانک را روی دستگاه مدیر نگه می‌داریم تا اگر
+    // کالایی مدتی حذف و بعد دوباره وارد شد، شمارش سه نوبت آن از بین نرود.
+    Map<String, dynamic> history = {};
+    try {
+      final historyRaw = prefs.getString('product_new_appearance_history_v1');
+      if (historyRaw != null && historyRaw.isNotEmpty) {
+        history = Map<String, dynamic>.from(jsonDecode(historyRaw) as Map);
+      }
+    } catch (_) {
+      history = {};
     }
+
+    final normalizedProducts = <dynamic>[];
+    for (final rawItem in products) {
+      if (rawItem is! Map) continue;
+      final item = Map<String, dynamic>.from(rawItem);
+      final barcode = item['barcode']?.toString().trim() ?? '';
+      if (barcode.isEmpty) {
+        // کالای بدون بارکد را وارد شمارش بارکد نمی‌کنیم.
+        item['isNewProduct'] = item['isNewProduct'] == true;
+        normalizedProducts.add(item);
+        continue;
+      }
+
+      final historicalCount = (history[barcode] is num)
+          ? (history[barcode] as num).toInt().clamp(0, 4).toInt()
+          : ((item['newProductBankAppearances'] is num)
+              ? (item['newProductBankAppearances'] as num).toInt().clamp(0, 4).toInt()
+              : 0);
+
+      int appearanceCount;
+      if (oldBarcodes.contains(barcode)) {
+        // بارکد قبلاً در بانک سرور بوده؛ کالای قدیمی فقط به‌روزرسانی می‌شود.
+        // اگر هنوز در دوره سه‌نوبتی «جدید» است، یک نوبت دیگر جلو می‌رود.
+        appearanceCount = historicalCount > 0
+            ? (historicalCount + 1).clamp(1, 4).toInt()
+            : 0;
+      } else {
+        // بارکد برای اولین بار در بانک سرور دیده می‌شود.
+        appearanceCount = (historicalCount + 1).clamp(1, 4).toInt();
+      }
+
+      history[barcode] = appearanceCount;
+      item['newProductBankAppearances'] = appearanceCount;
+      item['isNewProduct'] = appearanceCount >= 1 && appearanceCount <= 3;
+      normalizedProducts.add(item);
+    }
+
+    products = normalizedProducts;
+    await prefs.setString('product_new_appearance_history_v1', jsonEncode(history));
+    await prefs.setString('product_database', jsonEncode(products));
 
     final dailyExpensesRaw = prefs.getString('daily_expenses') ?? '[]';
     final customEventsRaw = prefs.getString('custom_events') ?? '[]';
