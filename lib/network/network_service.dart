@@ -106,7 +106,7 @@ class NetworkService {
     }
   }
 
-  Future<void> queueEvent({
+  Future<String> queueEvent({
     required String type,
     required Map<String, dynamic> payload,
     String? actorName,
@@ -125,6 +125,7 @@ class NetworkService {
       'payload': payload,
     });
     await prefs.setString(_outboxKey, jsonEncode(events));
+    return events.last['id'].toString();
   }
 
   Future<bool> isOnline() async {
@@ -266,6 +267,30 @@ class NetworkService {
       return payload;
     } catch (_) {
       return null;
+    } finally {
+      await _close(client);
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchRecentEvents({int limit = 50}) async {
+    final config = await loadConfig();
+    if (!config.isConfigured) return [];
+    final client = HttpClient();
+    try {
+      final request = await client.getUrl(_restUri(config, 'network_events', {
+        'select': 'id,type,actor_name,created_at,payload',
+        'store_id': 'eq.${_scopedStoreId(config)}',
+        'order': 'created_at.desc',
+        'limit': '$limit',
+      })).timeout(const Duration(seconds: 7));
+      _headers(config).forEach(request.headers.set);
+      final response = await request.close().timeout(const Duration(seconds: 10));
+      final body = await response.transform(utf8.decoder).join();
+      if (response.statusCode < 200 || response.statusCode >= 300) return [];
+      final rows = jsonDecode(body) as List<dynamic>;
+      return rows.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+    } catch (_) {
+      return [];
     } finally {
       await _close(client);
     }
