@@ -1445,6 +1445,7 @@ class DeliveryScreen extends StatefulWidget {
 }
 
 class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObserver, RouteAware {
+  bool _isSavingInvoice = false;
   String _normalizeDigits(String value) {
     const fa = '۰۱۲۳۴۵۶۷۸۹';
     const ar = '٠١٢٣٤٥٦٧٨٩';
@@ -3841,6 +3842,10 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
         text: editGroup?.isNotEmpty == true && editGroup!.first.discount > 0
             ? _formatPrice(editGroup!.first.discount)
             : '');
+    final paidCtrl = TextEditingController(
+        text: editGroup?.isNotEmpty == true && editGroup!.first.isCredit && editGroup!.first.paidAmount > 0
+            ? _formatPrice(editGroup!.first.paidAmount)
+            : '');
     bool isCredit =
         editGroup?.isNotEmpty == true ? editGroup!.first.isCredit : false;
     final selected = <Map<String, dynamic>>[];
@@ -4168,6 +4173,28 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                 'مبلغ نهایی: ${_displayPrice(math.max(0, total - (int.tryParse(_normalizeDigits(discountCtrl.text).replaceAll(',', '')) ?? 0)))} ریال',
                                 style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green, fontSize: 16),
                               ),
+                              if (isCredit) ...[
+                                const SizedBox(height: 8),
+                                TextField(
+                                  controller: paidCtrl,
+                                  keyboardType: TextInputType.number,
+                                  inputFormatters: [ThousandsSeparatorInputFormatter()],
+                                  onChanged: (_) => setSheetState(() {}),
+                                  decoration: const InputDecoration(
+                                    labelText: 'مبلغ پرداختی فعلی (ریال)',
+                                    hintText: 'اگر بخشی از مبلغ پرداخت شد وارد کنید',
+                                    prefixIcon: Icon(Icons.payments_outlined),
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Builder(builder: (context) {
+                                  final paid = int.tryParse(_normalizeDigits(paidCtrl.text).replaceAll(',', '').trim()) ?? 0;
+                                  final finalTotal = math.max(0, total - (int.tryParse(_normalizeDigits(discountCtrl.text).replaceAll(',', '').trim()) ?? 0));
+                                  final remaining = math.max(0, finalTotal - paid);
+                                  return Text('مانده حساب: ${_displayPrice(remaining)} ریال', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.orange));
+                                }),
+                              ],
                               const SizedBox(height: 6),
                             FilledButton.icon(
                               icon: const Icon(Icons.check),
@@ -4177,6 +4204,8 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                               onPressed: selected.isEmpty
                                   ? null
                                   : () async {
+                                      if (_isSavingInvoice) return;
+                                      _isSavingInvoice = true;
                                       _closeKeyboard();
                                       if (isCredit &&
                                           (customerNameCtrl.text
@@ -4189,6 +4218,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                             .showSnackBar(const SnackBar(
                                                 content: Text(
                                                     'برای فروش نسیه، نام مشتری و شماره موبایل الزامی است')));
+                                        _isSavingInvoice = false;
                                         return;
                                       }
                                       final discount = int.tryParse(
@@ -4201,6 +4231,18 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           const SnackBar(content: Text('مبلغ تخفیف نمی‌تواند بیشتر از مجموع فاکتور باشد.')),
                                         );
+                                        _isSavingInvoice = false;
+                                        return;
+                                      }
+                                      final finalInvoiceTotal = math.max(0, total - discount);
+                                      final paidAmount = isCredit
+                                          ? (int.tryParse(_normalizeDigits(paidCtrl.text).replaceAll(',', '').trim()) ?? 0)
+                                          : finalInvoiceTotal;
+                                      if (paidAmount < 0 || paidAmount > finalInvoiceTotal) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          const SnackBar(content: Text('مبلغ پرداختی نمی‌تواند بیشتر از مبلغ نهایی فاکتور باشد.')),
+                                        );
+                                        _isSavingInvoice = false;
                                         return;
                                       }
                                       final now = DateTime.now()
@@ -4310,6 +4352,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                           customerPhone:
                                               customerPhoneCtrl.text.trim(),
                                           isCredit: isCredit,
+                                          paidAmount: paidAmount,
                                           date: editGroup != null
                                               ? dateCtrl.text.trim()
                                               : _getTodayDate(),
@@ -4344,6 +4387,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                               customerPhone:
                                                   customerPhoneCtrl.text.trim(),
                                               isCredit: isCredit,
+                                              paidAmount: paidAmount,
                                               date: _getTodayDate(),
                                               createdAt: now,
                                             ),
@@ -4396,6 +4440,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                                           ? '✏️ فاکتور شماره $invoiceNumber ویرایش شد'
                                           : '💰 فاکتور شماره $invoiceNumber با ${selected.length} قلم ثبت شد');
                                       setState(() {});
+                                      _isSavingInvoice = false;
                                       Navigator.pop(sheetContext);
                                       _showSuccessMessage(editGroup != null
                                           ? 'فاکتور شماره $invoiceNumber ویرایش شد ✅'
@@ -4419,6 +4464,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
     customerPhoneCtrl.dispose();
     searchCtrl.dispose();
     discountCtrl.dispose();
+    paidCtrl.dispose();
   }
 
   void _openProductDatabaseScreen() {
@@ -6008,9 +6054,12 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
               const SizedBox(height: 10),
               LayoutBuilder(
                 builder: (context, constraints) {
-                  final cardWidth = (constraints.maxWidth - 10) / 2;
+                  final columns = constraints.maxWidth >= 700 ? 4 : 2;
+                  final gap = (columns - 1) * 10;
+                  final cardWidth = (constraints.maxWidth - gap) / columns;
                   final cardHeight = cardWidth / 1.65;
                   final toolsHeight = (cardHeight * 2) + 10;
+                  final toolsPerPage = columns * 2;
                   final allTools = <Widget>[
                           _buildToolCard(
                             icon: Icons.local_shipping_outlined,
@@ -6076,7 +6125,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                             onTap: _openSalesProfitScreen,
                           ),
                   ];
-                  final pageCount = (allTools.length / 4).ceil();
+                  final pageCount = (allTools.length / toolsPerPage).ceil();
                   return SizedBox(
                     height: toolsHeight,
                     child: PageView.builder(
@@ -6084,12 +6133,12 @@ class _DeliveryScreenState extends State<DeliveryScreen> with WidgetsBindingObse
                       itemCount: pageCount,
                       onPageChanged: (index) => setState(() => _toolsPage = index),
                       itemBuilder: (context, pageIndex) {
-                        final pageTools = allTools.skip(pageIndex * 4).take(4).toList();
-                        while (pageTools.length < 4) {
+                        final pageTools = allTools.skip(pageIndex * toolsPerPage).take(toolsPerPage).toList();
+                        while (pageTools.length < toolsPerPage) {
                           pageTools.add(const SizedBox.shrink());
                         }
                         return GridView.count(
-                          crossAxisCount: 2,
+                          crossAxisCount: columns,
                           physics: const NeverScrollableScrollPhysics(),
                           padding: EdgeInsets.zero,
                           mainAxisSpacing: 10,
@@ -7924,6 +7973,10 @@ class _SalesInvoicesScreenState extends State<SalesInvoicesScreen> {
                                         ),
                                     ],
                                   ),
+                                  if (first.isCredit) ...[
+                                    const SizedBox(height: 4),
+                                    Text('💳 پرداخت‌شده: ${_displayPrice(first.paidAmount)} ریال  •  مانده: ${_displayPrice(first.remainingAmount)} ریال', style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.orange)),
+                                  ],
                                   if (first.customerPhone.isNotEmpty) ...[
                                     const SizedBox(height: 4),
                                     Text('📱 موبایل: ${first.customerPhone}',
@@ -11714,6 +11767,8 @@ class SalesInvoice {
   final String customerName;
   final String customerPhone;
   final bool isCredit;
+  final int paidAmount;
+  int get remainingAmount => math.max(0, totalPrice - discount - paidAmount);
   final String date;
   final String createdAt;
 
@@ -11729,6 +11784,7 @@ class SalesInvoice {
     required this.customerName,
     required this.customerPhone,
     required this.isCredit,
+    this.paidAmount = 0,
     required this.date,
     required this.createdAt,
   });
@@ -11745,6 +11801,7 @@ class SalesInvoice {
         customerName: customerName,
         customerPhone: customerPhone,
         isCredit: isCredit,
+        paidAmount: paidAmount,
         date: date,
         createdAt: createdAt,
       );
@@ -11761,6 +11818,7 @@ class SalesInvoice {
         'customerName': customerName,
         'customerPhone': customerPhone,
         'isCredit': isCredit,
+        'paidAmount': paidAmount,
         'date': date,
         'createdAt': createdAt,
       };
@@ -11777,6 +11835,7 @@ class SalesInvoice {
         customerName: json['customerName'] ?? '',
         customerPhone: json['customerPhone'] ?? '',
         isCredit: json['isCredit'] ?? false,
+        paidAmount: json['paidAmount'] is num ? (json['paidAmount'] as num).toInt() : 0,
         date: json['date'] ?? '',
         createdAt: json['createdAt'] ?? '',
       );
